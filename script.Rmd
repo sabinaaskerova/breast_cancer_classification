@@ -1,0 +1,148 @@
+---
+title: "Classification des tumeurs du sein"
+author: "Sabina Askerova"
+output: pdf_document
+---
+```{r message = FALSE}
+library(FactoMineR)
+library(factoextra)
+library(tidyverse)
+library(cluster)
+```
+
+```{r message = FALSE}
+metabric.data <- read.csv2('./data/METABRIC_RNA_Mutation.csv',header=TRUE,sep=",",
+row.names='patient_id')
+# supprimer les données de mutation que nous n'allons pas utiliser
+genes.data <- metabric.data[,1:519]
+# Conversion des colonnes au bon type
+genes.data <- type_convert(genes.data)
+# Première diminution de dimension par selection des $100$ gènes
+#les plus corrélées au score de gravité de Nottingham
+corre <- c()
+for (i in c(1:489)){
+corre <- c(corre,cor(genes.data[,21],genes.data[,i+30])**2)
+}
+selected <- order(corre,decreasing = TRUE)[1:100]
+genes.data <- genes.data[,c(1:30,30+selected)]
+```
+
+On veut réaliser une ACP (analyse en composantes principales) normée sur les données des 100 gènes considérées en gardant les variables médicales comme variables supplémentaires d’interprétation (les variables 1, 19, 20, 21, 23 et 28 sont quantitatives, les autres sont qualitatives).
+
+Les variables médicales n'étaient pas prises en compte lors du calcul des composantes principales.
+```{r}
+data.pca=genes.data[,-c(1:30)]
+pca.genes <- prcomp(data.pca)
+```
+
+Afin de décider sur le nombre de composantes à garder pour appliquer k-means, je calcule la variance cumulative pour chaque composante.
+```{r}
+# calcul de la variance cumulée pour les composantes
+eigenvalues <- pca.genes$sdev^2
+cumulative_variance <- cumsum(eigenvalues) / sum(eigenvalues)
+
+cumulative_info <- data.frame(Component = seq_along(cumulative_variance), 
+                               Cumulative_Variance = cumulative_variance)
+```
+
+70% de l'information sont gardés pour le nombre de composantes égal à 26.
+
+```{r}
+num_components <- which(cumulative_variance >= 0.7)[1]
+num_components 
+```
+J'extrais les 26 premières composantes pour appliquer k-means dessus par la suite.
+```{r}
+# 26 premières composantes de l'ACP
+pca.scores <- data.frame(pca.genes$x[, 1:num_components])
+```
+
+On veut regarder l’évolution de la somme des carrés intra-classes.
+Après la réduction de dimmensionnalité, j'applique k-means sur un nombre de clusters allant de 1 à 30.
+Je construis l'éboulis de WSS (within-cluster sum of squares) pour visualiser la réduction de la qualité de classification pour un nombre de classes entre 1 et 30.
+```{r}
+wcss <- vector()
+for (i in 1:30) {
+  kmeans_model <- kmeans(pca.scores, centers = i, iter.max = 20)
+  wcss[i] <- kmeans_model$tot.withinss
+}
+# éboulis des sommes des carrés intra-classes
+wss_df <- tibble(clusters = 1:30, wss = wcss)
+scree_plot <- ggplot(wss_df, aes(x = clusters, y = wss)) +
+  geom_point(size = 3) +
+  geom_line() +
+  scale_x_continuous(breaks = c(1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30)) +
+  xlab('Nombre de clusters') +
+  ylab('WCSS')
+scree_plot
+```
+
+Comme l'ajout de clusters ultérieur n'apporte pas une réduction significative de la WSS, en utilisant le critère du coude, je choisis le nombre de classes égal à deux.
+
+
+```{r}
+km_res <- kmeans(pca.scores, centers=2, iter.max = 100, nstart = 20)
+fviz_cluster(km_res,data=data.pca,geom="point")
+```
+Les individus sont séparés en deux classes distinctes avec la plupart des valeurs loin de la frontière entre les classes.
+Le chevauchement entre deux classes est dû à la perte d'information inhérente à la réduction de dimensionnalité. La projection sur les deux premières composantes ne contient que 29.8% de l'information.    
+Les clusters dans l'espace d'origine ont donc des corrélations non linéaires.
+
+A l’aide de tests du chi-deux, on veut trouver les variables médicales qualitatives auxquelles les classes trouvées sont les plus liées. On veut comparer les trois premières
+d’entre elles avec la classification établie, et utilisant la fonction table
+qui permet d’établir des tables de contingence. Commenter les résultats en terme d’interprétation de la classification établie.
+
+```{r}
+# Labels de classe pour chaque individu
+cluster_labels <- km_res$cluster
+```
+
+```{r warning = FALSE}
+qualitative_vars <- genes.data[, c(2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,22,24,25,26,27,29,30)]
+
+data.chi.sq <- cbind(qualitative_vars, Cluster = factor(cluster_labels))
+
+# test du khi-deux pour chaque variable médicale qualitative
+chi_square_results <- lapply(1:ncol(qualitative_vars), function(i) {
+  contingency_table <- table(data.chi.sq[, i], data.chi.sq$Cluster)
+  chisq.test(contingency_table)
+})
+
+# p-valeurs correspondantes aux indices des variables qualitatives
+p_values <- sapply(chi_square_results, function(test) test$p.value)
+ch2_quali <- data.frame(variable_index = c(2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,22,24,25,26,27,29,30),
+                        p_Value = p_values)
+
+# p-valeurs triées
+ch2_quali_sorted <- ch2_quali[order(ch2_quali$p_Value), ]
+ch2_quali_sorted
+```
+
+Les variables qualitatives pour lesquelles la p-valeur est la plus petite (très loin de l'indépendance) sont
+17, 7, 27 (resp. integrative_cluster, pam50_._claudin.low_subtype, X3.gene_classifier_subtype)
+
+```{r}
+# les noms des trois variables les plus liées aux classes de k-means 
+selected_variables <- ch2_quali_sorted$variable_index[1:3]
+selected_variables_names <- names(genes.data)[selected_variables]
+```
+
+
+```{r}
+# les données pour les trois variables qualitatives et les classes de k-means
+subset.data <- data.chi.sq[, c(selected_variables_names, "Cluster")]
+
+# tables de comptage pour les trois variables qualitatives
+contingency_tables <- lapply(selected_variables_names, function(variable_name) {
+  contingency_table <- table(subset.data[, variable_name], subset.data$Cluster)
+  return(contingency_table)
+})
+
+contingency_tables
+```
+
+En cosultant les tables de contingence, il est possible d'observer quelles caractéristiques sont fortement associées aux classes.
+
+Les individus de la première classe ont plus souvent les sous-types 2, 3, 4ER+, 7 et 8 de cancer, ER+/HER2- de profileration basse ou elevée et LumA, LumB et Normal comme les résultats du test PAM 50.
+
+Les individus de la deuxième classe ont plus souvent les sous-types 10 et 5 de cancer, ER-/HER2- ou HER2+ et Basal, Her2 comme les résultats du test PAM 50.
